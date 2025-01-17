@@ -1,43 +1,86 @@
 #![allow(clippy::empty_docs)]
+pub mod bevy_plugin;
 mod core;
 mod nodes;
 mod objects;
+pub mod oxr_render_plugin;
 mod session;
 #[cfg(feature = "wayland")]
 mod wayland;
 
 use crate::core::destroy_queue;
-use crate::nodes::items::camera;
-use crate::nodes::{audio, drawable, input};
+// use crate::nodes::items::camera;
+use crate::nodes::input;
 
+use bevy::a11y::AccessibilityPlugin;
+use bevy::app::{
+	App, AppExit, PluginGroup, PostUpdate, ScheduleRunnerPlugin, Startup,
+	TerminalCtrlCHandlerPlugin, Update,
+};
+use bevy::asset::{load_internal_binary_asset, AssetApp as _, AssetPlugin, AssetServer, Handle};
+use bevy::audio::AudioPlugin;
+use bevy::color::Color;
+use bevy::core_pipeline::{CorePipelinePlugin, Skybox};
+use bevy::gizmos::GizmoPlugin;
+use bevy::gltf::GltfPlugin;
+use bevy::image::Image;
+use bevy::input::InputPlugin;
+use bevy::pbr::PbrPlugin;
+use bevy::prelude::{
+	on_event, Camera3d, ClearColor, Commands, Entity, EventReader, HierarchyPlugin, ImagePlugin,
+	IntoSystemConfigs, Local, Query, Res, ResMut, Resource, TransformPlugin, With, World,
+};
+use bevy::render::pipelined_rendering::PipelinedRenderingPlugin;
+use bevy::render::RenderPlugin;
+use bevy::scene::ScenePlugin;
+use bevy::text::{Font, FontLoader};
+use bevy::time::Time;
+use bevy::window::WindowPlugin;
+use bevy::winit::{WakeUp, WinitPlugin};
+use bevy::MinimalPlugins;
+use bevy_mod_meshtext::MeshTextPlugin;
+use bevy_mod_openxr::action_set_syncing::{OxrActionSyncingPlugin, OxrSyncActionSet};
+use bevy_mod_openxr::exts::OxrExtensions;
+use bevy_mod_openxr::features::overlay::{OxrOverlaySessionEvent, OxrOverlaySettings};
+use bevy_mod_openxr::init::{should_run_frame_loop, OxrInitPlugin};
+use bevy_mod_openxr::render::{update_cameras, OxrRenderPlugin};
+use bevy_mod_openxr::resources::{OxrFrameState, OxrFrameWaiter, OxrGraphicsInfo};
+use bevy_mod_openxr::session::OxrSession;
+use bevy_mod_openxr::spaces::OxrSpaceExt;
+use bevy_mod_openxr::types::{AppInfo, Version};
+use bevy_mod_openxr::{add_xr_plugins, openxr_session_running};
+use bevy_mod_xr::session::{XrFirst, XrPreDestroySession, XrSessionCreated};
+use bevy_mod_xr::spaces::XrPrimaryReferenceSpace;
+use bevy_plugin::{DbusConnection, DummyPbrPlugin, InputUpdate, StardustBevyPlugin, StardustFirst};
+use bevy_sk::skytext::SphericalHarmonicsPlugin;
 use clap::Parser;
 use core::client::Client;
 use core::task;
 use directories::ProjectDirs;
+use nodes::audio::StardustSoundPlugin;
+use nodes::drawable::lines::BevyLinesPlugin;
+use nodes::drawable::model::StardustModelPlugin;
+use nodes::drawable::text::StardustTextPlugin;
+use objects::input::sk_controller::StardustControllerPlugin;
+use objects::input::sk_hand::StardustHandPlugin;
 use objects::ServerObjects;
 use once_cell::sync::OnceCell;
+use openxr::OverlaySessionCreateFlagsEXTX;
+use oxr_render_plugin::StardustOxrRenderPlugin;
 use session::{launch_start, save_session};
 use stardust_xr::schemas::dbus::object_registry::ObjectRegistry;
 use stardust_xr::server;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
-use stereokit_rust::material::Material;
-use stereokit_rust::shader::Shader;
-use stereokit_rust::sk::{
-	sk_quit, AppMode, DepthMode, DisplayBlend, OriginMode, QuitReason, SkSettings,
-};
-use stereokit_rust::system::{Handed, Input, LogLevel, Renderer};
-use stereokit_rust::tex::{SHCubemap, Tex, TexFormat, TexType};
-use stereokit_rust::ui::Ui;
-use stereokit_rust::util::{Color128, Time};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
-use tracing::metadata::LevelFilter;
-use tracing::{debug_span, error, info};
+use tracing::{debug_span, error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use zbus::fdo::ObjectManager;
 use zbus::Connection;
+
+pub type DefaultMaterial = bevy_sk::vr_materials::PbrMaterial;
 
 #[derive(Debug, Clone, Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -45,6 +88,10 @@ struct CliArgs {
 	/// Force flatscreen mode and use the mouse pointer as a 3D pointer
 	#[clap(short, long, action)]
 	flatscreen: bool,
+
+	/// Force Pipelined Rending, improving fps at the cost of latency
+	#[clap(short, long, action)]
+	pipelined_rendering: bool,
 
 	/// If monado insists on emulating them, set this flag...we want the raw input
 	#[clap(long)]
@@ -71,11 +118,26 @@ struct CliArgs {
 }
 
 static STARDUST_INSTANCE: OnceCell<String> = OnceCell::new();
+static TOKIO: RuntimeWrapper = RuntimeWrapper(OnceCell::new());
 
-// #[tokio::main]
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-	color_eyre::install().unwrap();
+struct RuntimeWrapper(OnceCell<tokio::runtime::Runtime>);
+impl Deref for RuntimeWrapper {
+	type Target = tokio::runtime::Runtime;
+
+	fn deref(&self) -> &Self::Target {
+		self.0.get().unwrap()
+	}
+}
+
+fn main() -> color_eyre::Result<AppExit> {
+	let runtime = tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.build()?;
+	TOKIO.0.set(runtime).unwrap();
+	TOKIO.block_on(setup())
+}
+async fn setup() -> color_eyre::Result<AppExit> {
+	color_eyre::install()?;
 
 	let registry = tracing_subscriber::registry();
 
@@ -151,12 +213,13 @@ async fn main() {
 		let cli_args = cli_args.clone();
 		let dbus_connection = dbus_connection.clone();
 		move || {
-			stereokit_loop(
+			bevy_loop(
 				sk_ready_notifier,
 				project_dirs,
 				cli_args,
 				dbus_connection,
 				object_registry,
+				false,
 			)
 		}
 	});
@@ -166,10 +229,7 @@ async fn main() {
 		.map(|project_dirs| launch_start(&cli_args, project_dirs))
 		.unwrap_or_default();
 
-	tokio::select! {
-		_ = stereokit_loop => (),
-		_ = tokio::signal::ctrl_c() => unsafe {sk_quit(QuitReason::SystemClose)},
-	}
+	let exit = stereokit_loop.await?;
 	info!("Stopping...");
 	if let Some(project_dirs) = project_dirs {
 		save_session(&project_dirs).await;
@@ -179,72 +239,209 @@ async fn main() {
 	}
 
 	info!("Cleanly shut down Stardust");
+	Ok(exit)
 }
 
-fn stereokit_loop(
+fn bevy_loop(
 	sk_ready_notifier: Arc<Notify>,
 	project_dirs: Option<ProjectDirs>,
 	args: CliArgs,
 	dbus_connection: Connection,
 	object_registry: ObjectRegistry,
-) {
-	let sk = SkSettings::default()
-		.app_name("Stardust XR")
-		.blend_preference(DisplayBlend::AnyTransparent)
-		.mode(if args.flatscreen {
-			AppMode::Simulator
-		} else {
-			AppMode::XR
-		})
-		.depth_mode(DepthMode::D32)
-		.log_filter(match EnvFilter::from_default_env().max_level_hint() {
-			Some(LevelFilter::ERROR) => LogLevel::Error,
-			Some(LevelFilter::WARN) => LogLevel::Warning,
-			Some(LevelFilter::INFO) => LogLevel::Inform,
-			Some(LevelFilter::DEBUG) => LogLevel::Diagnostic,
-			Some(LevelFilter::TRACE) => LogLevel::Diagnostic,
-			Some(LevelFilter::OFF) => LogLevel::None,
-			None => LogLevel::Warning,
-		})
-		.overlay_app(args.overlay_priority.is_some())
-		.overlay_priority(args.overlay_priority.unwrap_or(u32::MAX))
-		.disable_desktop_input_window(true)
-		.origin(OriginMode::Local)
-		.init()
-		.expect("StereoKit failed to initialize");
-	info!("Init StereoKit");
-
-	Renderer::multisample(0);
-	Material::default().shader(Shader::pbr_clip());
-	Ui::enable_far_interact(false);
-
-	let left_hand_material = Material::find("default/material_hand").unwrap();
-	let mut right_hand_material = left_hand_material.copy();
-	right_hand_material.id("right_hand");
-	Input::hand_material(Handed::Right, Some(Material::find("right_hand").unwrap()));
-
-	Input::hand_visible(Handed::Left, false);
-	Input::hand_visible(Handed::Right, false);
-
-	// Skytex/light stuff
-	{
-		if let Some(sky) = project_dirs
-			.as_ref()
-			.map(|dirs| dirs.config_dir().join("skytex.hdr"))
-			.filter(|f| f.exists())
-			.and_then(|p| SHCubemap::from_cubemap(p, true, 100).ok())
-		{
-			sky.render_as_sky();
-		} else {
-			Renderer::skytex(Tex::gen_color(
-				Color128::BLACK,
-				1,
-				1,
-				TexType::Cubemap,
-				TexFormat::RGBA32,
-			));
+	headless: bool,
+) -> AppExit {
+	let mut bevy_app = App::new();
+	// let base = (DefaultPlugins)
+	// 	.build()
+	// 	.disable::<PipelinedRenderingPlugin>()
+	// 	.disable::<LogPlugin>()
+	// 	.set({
+	// 		let mut plugin = WinitPlugin::<WakeUp>::default();
+	// 		plugin.run_on_any_thread = true;
+	// 		plugin
+	// 	});
+	let mut base = (MinimalPlugins)
+		.build()
+		.disable::<ScheduleRunnerPlugin>()
+		.add(TransformPlugin)
+		.add(HierarchyPlugin)
+		.add(InputPlugin)
+		.add(AccessibilityPlugin);
+	base = match headless {
+		true => {
+			base.add(ScheduleRunnerPlugin {
+				// In OpenXR framepacing we trust (else this will eat all of the cpu)
+				run_mode: bevy::app::RunMode::Loop { wait: None },
+			})
 		}
+		false => base.add(WindowPlugin::default()).add({
+			let mut plugin = WinitPlugin::<WakeUp>::default();
+			plugin.run_on_any_thread = true;
+			plugin
+		}),
+	};
+	base = base
+		.add(TerminalCtrlCHandlerPlugin)
+		// might want to modify this in the future?
+		.add(AssetPlugin::default())
+		// will be replaced by bevy_mod_openxr when using OpenXR
+		.add(RenderPlugin::default())
+		.add(ImagePlugin::default())
+		.add(CorePipelinePlugin)
+		// very unsure what is needed here
+		.add(PbrPlugin {
+			// hoping that there is very little overdraw in stardust
+			prepass_enabled: false,
+			add_default_deferred_lighting_plugin: false,
+			use_gpu_instance_buffer_builder: false,
+		})
+		// .add(DummyPbrPlugin)
+		.add(ScenePlugin)
+		.add(GltfPlugin::default())
+		.add(AudioPlugin::default())
+		.add(GizmoPlugin)
+		.add(bevy_sk::vr_materials::SkMaterialPlugin {
+			replace_standard_material: true,
+		})
+		.add(bevy_sk::hand::HandPlugin)
+		.add(SphericalHarmonicsPlugin);
+
+	if args.pipelined_rendering {
+		base = base.add(PipelinedRenderingPlugin);
 	}
+
+	if args.flatscreen {
+		bevy_app.add_plugins(base);
+	} else {
+		bevy_app.add_plugins(
+			add_xr_plugins(base)
+				.set(OxrInitPlugin {
+					app_info: AppInfo {
+						name: "Stardust XR".into(),
+						version: Version(0, 44, 1),
+					},
+					exts: {
+						let mut exts = OxrExtensions::default();
+						exts.enable_hand_tracking();
+						if args.overlay_priority.is_some() {
+							exts.enable_extx_overlay();
+						}
+						exts
+					},
+					blend_modes: Some(vec![
+						openxr::EnvironmentBlendMode::ALPHA_BLEND,
+						openxr::EnvironmentBlendMode::OPAQUE,
+					]),
+					synchronous_pipeline_compilation: false,
+					..Default::default()
+				})
+				.disable::<OxrRenderPlugin>()
+				.disable::<OxrActionSyncingPlugin>()
+				.add_after::<OxrInitPlugin>(StardustOxrRenderPlugin),
+		);
+		if let Some(priority) = args.overlay_priority {
+			bevy_app.insert_resource(OxrOverlaySettings {
+				session_layer_placement: priority,
+				flags: OverlaySessionCreateFlagsEXTX::EMPTY,
+			});
+		}
+		bevy_app.add_event::<OxrSyncActionSet>();
+		bevy_app.add_plugins(bevy_xr_utils::hand_gizmos::HandGizmosPlugin);
+	}
+	bevy_app
+		.init_asset::<Font>()
+		.init_asset_loader::<FontLoader>();
+	bevy_app.add_plugins(MeshTextPlugin);
+	bevy_app.add_plugins(StardustBevyPlugin);
+	bevy_app.add_plugins((
+		BevyLinesPlugin,
+		StardustModelPlugin,
+		StardustHandPlugin,
+		StardustTextPlugin,
+		StardustSoundPlugin,
+		StardustControllerPlugin,
+	));
+	load_internal_binary_asset!(
+		bevy_app,
+		Handle::default(),
+		"nodes/drawable/assets/FiraMono-subset.ttf",
+		|bytes: &[u8], _path: String| { Font::try_from_bytes(bytes.to_vec()).unwrap() }
+	);
+	#[derive(Resource)]
+	struct SkyTexture(Handle<Image>);
+	// Skytex/light stuff
+	bevy_app.add_systems(
+		Startup,
+		move |assests: Res<AssetServer>, mut cmds: Commands| {
+			if let Some(sky) = project_dirs
+				.as_ref()
+				.map(|dirs| dirs.config_dir().join("skytex.hdr"))
+				.filter(|f| f.exists())
+				.map(|p| assests.load(p))
+			{
+				cmds.insert_resource(SkyTexture(sky));
+			}
+		},
+	);
+	#[derive(Resource)]
+	struct RenderBackground(bool);
+	fn update_background(
+		graphics_info: Res<OxrGraphicsInfo>,
+		mut overlay_events: EventReader<OxrOverlaySessionEvent>,
+		mut last_hidden: Local<bool>,
+		cams: Query<Entity, With<Camera3d>>,
+		mut cmds: Commands,
+	) {
+		let env_hidden = graphics_info.blend_mode != openxr::EnvironmentBlendMode::OPAQUE
+			&& overlay_events
+				.read()
+				.last()
+				.map(
+					|OxrOverlaySessionEvent::MainSessionVisibilityChanged { visible, flags: _ }| {
+						*visible
+					},
+				)
+				.unwrap_or(true);
+		if env_hidden && !*last_hidden {
+			cams.iter().for_each(|e| {
+				cmds.entity(e).remove::<Skybox>();
+			});
+			let _span = debug_span!("spawn");
+			cmds.insert_resource(ClearColor(Color::NONE));
+		}
+		*last_hidden = env_hidden;
+	}
+	bevy_app.add_systems(XrSessionCreated, update_background);
+	bevy_app.add_systems(
+		PostUpdate,
+		(|mut objects: ResMut<ServerObjects>,
+		  ref_space: Res<XrPrimaryReferenceSpace>,
+		  session: Res<OxrSession>| {
+			objects
+				.ref_space
+				.replace(unsafe { ref_space.as_openxr_space(&session) });
+			objects.view_space.replace(
+				session
+					.deref()
+					.deref()
+					.create_reference_space(
+						openxr::ReferenceSpaceType::VIEW,
+						openxr::Posef::IDENTITY,
+					)
+					.unwrap(),
+			);
+		})
+		.run_if(on_event::<bevy_mod_xr::session::XrSessionCreatedEvent>),
+	);
+	bevy_app.add_systems(XrPreDestroySession, |mut objetcs: ResMut<ServerObjects>| {
+		objetcs.ref_space = None;
+		objetcs.view_space = None;
+	});
+	bevy_app.add_systems(
+		Update,
+		update_background.run_if(on_event::<OxrOverlaySessionEvent>),
+	);
+	bevy_app.insert_resource(DbusConnection(dbus_connection.clone()));
 
 	#[cfg(feature = "wayland")]
 	let mut wayland = wayland::Wayland::new().expect("Could not initialize wayland");
@@ -253,61 +450,84 @@ fn stereokit_loop(
 	sk_ready_notifier.notify_waiters();
 	info!("Stardust ready!");
 
-	let mut objects = ServerObjects::new(
-		dbus_connection.clone(),
-		&sk,
-		[left_hand_material, right_hand_material],
-		args.disable_controllers,
-		args.disable_hands,
-	);
+	let objects = ServerObjects::new(dbus_connection.clone());
+	fn sync_sets(session: Res<OxrSession>, mut events: EventReader<OxrSyncActionSet>) {
+		let sets = events
+			.read()
+			.map(|v| &v.0)
+			.map(openxr::ActiveActionSet::new)
+			.collect::<Vec<_>>();
+		if sets.is_empty() {
+			return;
+		}
 
-	let mut last_frame_delta = Duration::ZERO;
-	let mut sleep_duration = Duration::ZERO;
-	while let Some(token) = sk.step() {
-		let _span = debug_span!("StereoKit step");
+		if let Err(err) = session.sync_actions(&sets) {
+			warn!("error while syncing actionsets: {}", err.to_string());
+		}
+	}
+
+	bevy_app.insert_resource(objects);
+
+	fn bevy_step(world: &mut World) {
+		let _span = debug_span!("Bevy step");
 		let _span = _span.enter();
-
-		camera::update(token);
+		// camera::update(token);
 		#[cfg(feature = "wayland")]
 		wayland.frame_event();
 		destroy_queue::clear();
 
-		objects.update(&sk, token, &dbus_connection, &object_registry);
+		let time = world.get_resource_mut::<OxrFrameState>().map(|mut s| {
+			let t = openxr::Time::from_nanos(
+				s.predicted_display_time.as_nanos() + s.predicted_display_period.as_nanos(),
+			);
+			s.predicted_display_time = t;
+			t
+		});
+		world.run_schedule(XrFirst);
+		if world
+			.run_system_cached(openxr_session_running)
+			.unwrap_or(true)
+		{
+			let _ = world.run_system_cached(sync_sets);
+		}
+		let thread = world
+			.run_system_cached(should_run_frame_loop)
+			.unwrap_or(true)
+			.then(|| world.remove_resource::<OxrFrameWaiter>())
+			.flatten()
+			.map(|mut waiter| {
+				TOKIO.spawn_blocking(move || {
+					let _span = debug_span!("frame eeping").entered();
+					let result = waiter.wait();
+					(waiter, result)
+				})
+			});
+		world.run_schedule(InputUpdate);
+		debug_span!("update_objects").in_scope(|| {
+			let session = world.remove_resource::<OxrSession>();
+			let mut objects = world.remove_resource::<ServerObjects>().unwrap();
+			objects.update(session.as_deref(), time);
+			world.insert_resource(objects);
+			if let Some(session) = session {
+				world.insert_resource(session);
+			}
+		});
 		input::process_input();
-		nodes::root::Root::send_frame_events(Time::get_step_unscaled());
-		adaptive_sleep(
-			&mut last_frame_delta,
-			&mut sleep_duration,
-			Duration::from_micros(250),
-		);
-
-		#[cfg(feature = "wayland")]
-		wayland.update();
-		drawable::draw(token);
-		audio::update();
-	}
-
-	info!("Cleanly shut down StereoKit");
-}
-
-fn adaptive_sleep(
-	last_frame_delta: &mut Duration,
-	sleep_duration: &mut Duration,
-	sleep_duration_increase: Duration,
-) {
-	let frame_delta = Duration::from_secs_f64(Time::get_step_unscaled());
-	if *last_frame_delta < frame_delta {
-		if let Some(frame_delta_delta) = frame_delta.checked_sub(*last_frame_delta) {
-			if let Some(new_sleep_duration) = sleep_duration.checked_sub(frame_delta_delta) {
-				*sleep_duration = new_sleep_duration;
+		nodes::root::Root::send_frame_events(world.resource::<Time>().delta_secs_f64());
+		if let Some((waiter, Ok(state))) = thread.map(|t| TOKIO.block_on(t).unwrap()) {
+			world.insert_resource(OxrFrameState(state));
+			world.insert_resource(waiter);
+			if let Err(err) = world.run_system_cached(update_cameras) {
+				error!("error while running oxr update_cameras system: {err}");
 			}
 		}
-	} else {
-		*sleep_duration += sleep_duration_increase;
+		#[cfg(feature = "wayland")]
+		wayland.update();
 	}
+	bevy_app.add_systems(StardustFirst, bevy_step);
+	let out = bevy_app.run();
 
-	debug_span!("Sleep", ?sleep_duration, ?frame_delta, ?last_frame_delta).in_scope(|| {
-		*last_frame_delta = frame_delta;
-		std::thread::sleep(*sleep_duration); // to give clients a chance to even update anything before drawing
-	});
+	#[cfg(feature = "wayland")]
+	drop(wayland);
+	out
 }

@@ -10,9 +10,9 @@ pub mod spatial;
 use self::alias::Alias;
 use crate::core::client::Client;
 use crate::core::error::{Result, ServerError};
+use crate::core::queued_mutex::QueuedMutex;
 use crate::core::registry::Registry;
 use crate::core::scenegraph::MethodResponseSender;
-use parking_lot::Mutex;
 use portable_atomic::{AtomicBool, Ordering};
 use rustc_hash::FxHashMap;
 use serde::{de::DeserializeOwned, Serialize};
@@ -20,6 +20,7 @@ use spatial::Spatial;
 use stardust_xr::messenger::MessageSenderHandle;
 use stardust_xr::scenegraph::ScenegraphError;
 use stardust_xr::schemas::flex::{deserialize, serialize};
+use tracing::debug_span;
 use std::any::{Any, TypeId};
 use std::fmt::Debug;
 use std::os::fd::OwnedFd;
@@ -125,17 +126,24 @@ impl Node {
 		))
 	}
 	pub fn enabled(&self) -> bool {
-		self.enabled.load(Ordering::Relaxed)
-			&& if let Ok(spatial) = self.get_aspect::<Spatial>() {
-				spatial
-					.global_transform()
-					.to_scale_rotation_translation()
-					.0
-					.length_squared()
-					> 0.0
-			} else {
-				true
-			}
+		let bool = {
+			let _span = debug_span!("load atomic bool").entered();
+			self.enabled.load(Ordering::Relaxed)
+		};
+		bool && if let Ok(spatial) = {
+			let _span = debug_span!("get spatial aspect").entered();
+			self.get_aspect::<Spatial>()
+		} {
+			let _span = debug_span!("check if scale is zero").entered();
+			spatial
+				.global_transform()
+				.to_scale_rotation_translation()
+				.0
+				.length_squared()
+				> 0.0
+		} else {
+			true
+		}
 	}
 	pub fn set_enabled(&self, enabled: bool) {
 		self.enabled.store(enabled, Ordering::Relaxed)
@@ -324,7 +332,7 @@ pub trait Aspect: Any + Send + Sync + 'static {
 }
 
 #[derive(Default)]
-struct Aspects(Mutex<FxHashMap<u64, Arc<dyn Aspect>>>);
+struct Aspects(QueuedMutex<FxHashMap<u64, Arc<dyn Aspect>>>);
 impl Aspects {
 	fn add<A: AspectIdentifier>(&self, t: A) -> Arc<A> {
 		let aspect = Arc::new(t);
@@ -336,7 +344,7 @@ impl Aspects {
 	}
 	fn get<A: Aspect + AspectIdentifier>(&self) -> Result<Arc<A>> {
 		self.0
-			.lock()
+			.read_now()
 			.get(&A::ID)
 			.cloned()
 			.map(|a| a.as_any())

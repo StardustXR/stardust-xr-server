@@ -1,8 +1,5 @@
 pub mod lines;
 pub mod model;
-#[cfg(feature = "wayland")]
-pub mod shader_manipulation;
-pub mod shaders;
 pub mod text;
 
 use self::{lines::Lines, model::Model, text::Text};
@@ -10,32 +7,16 @@ use super::{
 	spatial::{Spatial, Transform},
 	Aspect, AspectIdentifier, Node,
 };
-use crate::core::{client::Client, error::Result, resource::get_resource_file};
+use crate::core::{
+	client::Client,
+	error::{Result, ServerError},
+	resource::get_resource_file,
+};
 use crate::nodes::spatial::SPATIAL_ASPECT_ALIAS_INFO;
-use color_eyre::eyre::eyre;
 use model::ModelPart;
 use parking_lot::Mutex;
 use stardust_xr::values::ResourceID;
 use std::{ffi::OsStr, path::PathBuf, sync::Arc};
-use stereokit_rust::{sk::MainThreadToken, system::Renderer, tex::SHCubemap};
-
-// #[instrument(level = "debug", skip(sk))]
-pub fn draw(token: &MainThreadToken) {
-	lines::draw_all(token);
-	model::draw_all(token);
-	text::draw_all(token);
-
-	if let Some(skytex) = QUEUED_SKYTEX.lock().take() {
-		if let Ok(skytex) = SHCubemap::from_cubemap(skytex, true, 100) {
-			Renderer::skytex(skytex.tex);
-		}
-	}
-	if let Some(skylight) = QUEUED_SKYLIGHT.lock().take() {
-		if let Ok(skylight) = SHCubemap::from_cubemap(skylight, true, 100) {
-			Renderer::skylight(skylight.sh);
-		}
-	}
-}
 
 static QUEUED_SKYLIGHT: Mutex<Option<PathBuf>> = Mutex::new(None);
 static QUEUED_SKYTEX: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -70,7 +51,7 @@ impl Aspect for Text {
 impl InterfaceAspect for Interface {
 	fn set_sky_tex(_node: Arc<Node>, calling_client: Arc<Client>, tex: ResourceID) -> Result<()> {
 		let resource_path = get_resource_file(&tex, &calling_client, &[OsStr::new("hdr")])
-			.ok_or(eyre!("Could not find resource"))?;
+			.ok_or(ServerError::NoResource)?;
 		QUEUED_SKYTEX.lock().replace(resource_path);
 		Ok(())
 	}
@@ -81,7 +62,7 @@ impl InterfaceAspect for Interface {
 		light: ResourceID,
 	) -> Result<()> {
 		let resource_path = get_resource_file(&light, &calling_client, &[OsStr::new("hdr")])
-			.ok_or(eyre!("Could not find resource"))?;
+			.ok_or(ServerError::NoResource)?;
 		QUEUED_SKYLIGHT.lock().replace(resource_path);
 		Ok(())
 	}

@@ -9,6 +9,11 @@ license = "GPLv2"
 repository = "https://github.com/StardustXR/stardust-xr-server/"
 homepage = "https://stardustxr.org"
 
+[patch.crates-io]
+tracing-tracy = { git = "https://github.com/nagisa/rust_tracy_client", tag = "tracy-client-v0.17.6" }
+tracy-client = { git = "https://github.com/nagisa/rust_tracy_client", tag = "tracy-client-v0.17.6" }
+tracy-client-sys = { git = "https://github.com/nagisa/rust_tracy_client", tag = "tracy-client-v0.17.6" }
+
 [workspace]
 members = ["codegen"]
 
@@ -21,11 +26,18 @@ name = "stardust-xr-server"
 path = "src/main.rs"
 
 [features]
-default = ["wayland"]
+default = []
 wayland = ["dep:smithay", "dep:wayland-scanner", "dep:wayland-backend"]
 profile_tokio = ["dep:console-subscriber", "tokio/tracing"]
 profile_app = ["dep:tracing-tracy"]
-local_deps = ["stereokit-rust/force-local-deps"]
+
+# Enable a small amount of optimization in the dev profile.
+[profile.dev]
+opt-level = 1
+
+# Enable a large amount of optimization in the dev profile for dependencies.
+[profile.dev.package."*"]
+opt-level = 3
 
 [package.metadata.appimage]
 auto_link = true
@@ -38,22 +50,24 @@ auto_link_exclude_list = [
 	"libEGL*",
 ]
 
-[profile.dev.package."*"]
-opt-level = 3
-debug = true
-strip = false
-debug-assertions = true
-overflow-checks = true
-
-[profile.release]
-opt-level = 3
-debug = "line-tables-only"
-strip = true
-debug-assertions = true
-overflow-checks = false
-lto = "thin"
-
 [dependencies]
+bevy = { version = "0.15.1", features = [
+	"wayland",
+	"mp3",
+	"wav",
+	"trace_tracy",
+] }
+bevy_mod_xr.git = "https://github.com/awtterpip/bevy_oxr"
+bevy_mod_openxr.git = "https://github.com/awtterpip/bevy_oxr"
+bevy_xr_utils.git = "https://github.com/awtterpip/bevy_oxr"
+# bevy_mod_xr = { git = "https://github.com/Schmarni-Dev/bevy_openxr", branch = "pbr" }
+# bevy_mod_openxr = { git = "https://github.com/Schmarni-Dev/bevy_openxr", branch = "pbr" }
+# bevy_xr_utils = { git = "https://github.com/Schmarni-Dev/bevy_openxr", branch = "pbr" }
+bevy_mod_meshtext.git = "https://github.com/Schmarni-Dev/bevy_mod_meshtext"
+# bevy_sk.path = "../bevy_sk"
+bevy_sk.git = "https://github.com/MalekiRe/bevy_sk"
+openxr = "0.19"
+winit = { version = "0.30", default-features = false, features = [] }
 # small utility thingys
 once_cell = "1.19.0"
 nanoid = "0.4.0"
@@ -92,11 +106,13 @@ input-event-codes = "6.2.0"
 zbus = { version = "5.0.0", default-features = false, features = ["tokio"] }
 directories = "5.0.1"
 xkbcommon-rs = "0.1.0"
+thiserror = "2.0.9"
+crossbeam-channel = "0.5.14"
+atomicow = "1.0.0"
 
 # wayland
-wayland-backend = { version = "0.3.7", optional = true, default-features = false }
-wayland-scanner = { version = "0.31.4", optional = true }
-thiserror = "2.0.9"
+wayland-scanner = { version = "0.31.2", optional = true }
+wayland-backend = { version = "0.3.4", optional = true }
 
 [dependencies.smithay]
 # git = "https://github.com/technobaboo/smithay.git"
@@ -104,16 +120,14 @@ thiserror = "2.0.9"
 git = "https://github.com/smithay/smithay.git"
 # path = "../smithay"
 default-features = false
-features = ["desktop", "backend_drm", "renderer_gl", "wayland_frontend"]
+features = [
+	"desktop",
+	"backend_drm",
+	"backend_egl",
+	"renderer_gl",
+	"wayland_frontend",
+]
 optional = true
-
-
-[dependencies.stereokit-rust]
-# path = "../StereoKit-rust"
-git = "https://github.com/mvvvv/StereoKit-rust.git"
-# git = "https://github.com/technobaboo/StereoKit-rust.git"
-features = ["no-event-loop"]
-default-features = false
 
 [dependencies.stardust-xr]
 workspace = true

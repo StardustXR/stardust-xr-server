@@ -1,6 +1,7 @@
 use crate::core::error::Result;
 use crate::nodes::alias::get_original;
 use crate::nodes::Node;
+use crate::TOKIO;
 use crate::{core::client::Client, nodes::Message};
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
@@ -14,6 +15,8 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, Weak};
 use tokio::sync::oneshot;
 use tracing::{debug, debug_span};
+
+stardust_xr_server_codegen::codegen_id_to_name_functions!();
 
 #[derive(Default)]
 pub struct Scenegraph {
@@ -68,7 +71,7 @@ impl MethodResponseSender {
 		self,
 		f: impl Future<Output = Result<(T, Vec<OwnedFd>)>> + Send + 'static,
 	) {
-		tokio::task::spawn(async move { self.0.send(map_method_return(f.await)) });
+		TOKIO.spawn(async move { self.0.send(map_method_return(f.await)) });
 	}
 }
 fn map_method_return<T: Serialize>(
@@ -95,7 +98,15 @@ impl scenegraph::Scenegraph for Scenegraph {
 		let Some(client) = self.get_client() else {
 			return Err(ScenegraphError::NodeNotFound);
 		};
-		debug_span!("Handle signal", aspect_id, node_id, method).in_scope(|| {
+		debug_span!(
+			"Handle signal",
+			aspect_id,
+			aspect_name = aspect_id_to_name(aspect_id),
+			node_id,
+			method,
+			signal_name = signal_id_to_name(method)
+		)
+		.in_scope(|| {
 			self.get_node(node_id)
 				.ok_or(ScenegraphError::NodeNotFound)?
 				.send_local_signal(
@@ -122,7 +133,14 @@ impl scenegraph::Scenegraph for Scenegraph {
 			let _ = response.send(Err(ScenegraphError::NodeNotFound));
 			return;
 		};
-		debug!(aspect_id, node_id, method, "Handle method");
+		debug!(
+			aspect_id,
+			aspect_name = aspect_id_to_name(aspect_id),
+			node_id,
+			method,
+			method_name = method_id_to_name(method),
+			"Handle method"
+		);
 		let Some(node) = self.get_node(node_id) else {
 			let _ = response.send(Err(ScenegraphError::NodeNotFound));
 			return;
